@@ -1,4 +1,5 @@
-#version = 1.0.0
+
+#version = 2.0.0
 import requests
 import msal
 import json
@@ -6,6 +7,164 @@ import argparse
 import jwt
 import time
 import urllib3
+
+# ----- Helper: Flexible Snipe-IT user lookup -----
+def find_snipe_user(azure_user, verify_ssl=True, verbose=False, slowdown=False):
+    """Try to find a Snipe-IT user id using multiple strategies:
+       - userPrincipalName (UPN)
+       - emailAddress
+       - username (explicit or derived from upn)
+       - display name (contains)
+       - azure userId (as last resort)
+    """
+    try:
+        if not isinstance(azure_user, dict):
+            return None
+
+        candidates = []
+        upn = (azure_user.get('userPrincipalName') or '').strip()
+        email = (azure_user.get('emailAddress') or '').strip()
+        uid = (azure_user.get('userId') or '').strip()
+        display = (azure_user.get('userDisplayName') or '').strip()
+        username = (azure_user.get('userName') or '').strip()
+
+        if upn:
+            candidates.append(('upn', upn))
+        if email and email != upn:
+            candidates.append(('email', email))
+        if username:
+            candidates.append(('username', username))
+        else:
+            if upn and '@' in upn:
+                candidates.append(('username_from_upn', upn.split('@', 1)[0]))
+        if display:
+            candidates.append(('displayName', display))
+        if uid:
+            candidates.append(('userId', uid))
+
+        if verbose:
+            print(f"find_snipe_user: candidates={candidates}")
+
+        for kind, term in candidates:
+            if not term:
+                continue
+            if verbose:
+                print(f"Searching Snipe-IT users by {kind}: '{term}'")
+            url = f"{SNIPE_IT_URL}/users"
+            params = {'search': term}
+            try:
+                resp = requests.get(url, headers=SNIPE_IT_HEADERS, params=params, verify=verify_ssl)
+            except Exception as e:
+                if verbose:
+                    print(f"Error querying Snipe-IT /users: {e}")
+                continue
+            if slowdown:
+                time.sleep(1)
+            if resp.status_code != 200:
+                if verbose:
+                    print(f"Snipe-IT /users returned {resp.status_code}: {resp.text}")
+                continue
+            try:
+                data = resp.json()
+            except Exception as e:
+                if verbose:
+                    print(f"Failed to decode /users JSON: {e}")
+                continue
+            rows = []
+            if isinstance(data, dict):
+                rows = data.get('rows') or []
+            elif isinstance(data, list):
+                rows = data
+            if verbose:
+                print(f"/users?search={term} returned {len(rows)} rows")
+            if not rows:
+                continue
+
+            # Try to find the best match among rows
+            def norm(s): return (s or '').strip().lower()
+            for user in rows:
+                user_email = (user.get('email') or user.get('emailAddress') or user.get('email_address') or '') or ''
+                user_username = (user.get('username') or user.get('name') or user.get('login') or '') or ''
+                user_display = (user.get('display_name') or user.get('name') or user.get('first_name') or '') or ''
+
+                if kind in ('upn','email') and user_email and norm(user_email) == norm(term):
+                    if verbose:
+                        print(f"Exact email match -> id {user.get('id')}")
+                    return user.get('id')
+                if kind in ('username','username_from_upn') and user_username and norm(user_username) == norm(term):
+                    if verbose:
+                        print(f"Exact username match -> id {user.get('id')}")
+                    return user.get('id')
+                if kind == 'displayName' and user_display and norm(term) in norm(user_display):
+                    if verbose:
+                        print(f"Display name contains -> id {user.get('id')}")
+                    return user.get('id')
+                # fallback exact compare
+                if (user_email and norm(user_email) == norm(term)) or (user_username and norm(user_username) == norm(term)) or (user_display and norm(user_display) == norm(term)):
+                    if verbose:
+                        print(f"Fallback match -> id {user.get('id')}")
+                    return user.get('id')
+
+            # if rows exist but no exact match, return first result as last resort
+            first = rows[0]
+            if verbose:
+                print(f"No exact match for '{term}', using first result id {first.get('id')}")
+            return first.get('id')
+
+        return None
+    except Exception as e:
+        print(f"Error in find_snipe_user: {e}")
+        return None
+
+
+# ----- Helper: get status id by name -----
+def get_status_id_by_name(status_name, verify_ssl=True, verbose=False, slowdown=False):
+    """Find a Snipe-IT status label by exact name (case-insensitive).
+
+Parameters
+----------
+status_name : str
+    Label to search for, e.g. 'Pending', 'Deployed', 'Ready to Deploy'.
+
+Returns
+-------
+int | None
+    Returns the ID of the matching status label, or None if no exact match found.
+Note: This function intentionally avoids returning the first search result to prevent incorrect mappings.
+"""
+    try:
+        if not status_name:
+            return None
+        if verbose:
+            print(f"Searching for Snipe-IT status label: {status_name}")
+        url = f"{SNIPE_IT_URL}/statuslabels"
+        params = {'search': status_name}
+        response = requests.get(url, headers=SNIPE_IT_HEADERS, params=params, verify=verify_ssl)
+        if slowdown:
+            time.sleep(1)
+        if response.status_code == 200:
+            rows = response.json().get('rows', []) if isinstance(response.json(), dict) else response.json()
+            for row in rows:
+                name = row.get('name') or row.get('label') or ''
+                if name and name.lower() == status_name.lower():
+                    if verbose:
+                        print(f"Found status label '{name}' -> ID {row.get('id')}")
+                    return row.get('id')
+            # If exact match not found, try first result
+            if rows:
+                first = rows[0]
+                if verbose:
+                    print(f"No exact match for status label. Using first result: {first.get('name')} (ID {first.get('id')})")
+                return first.get('id')
+            return None
+        else:
+            if verbose:
+                print(f"Failed to fetch status labels: {response.status_code} {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error while searching for status label: {e}")
+        return None
+
 
 # Load configuration from JSON file
 def load_config(file_path, verbose=False):
@@ -108,6 +267,18 @@ def get_devices(graph_token, verbose=False, slowdown=False):
 
 # Get device from Snipe-IT by serial number
 def get_device_by_serial(serial, verify_ssl=True, verbose=False, slowdown=False):
+    """Query Snipe-IT for an asset by serial number.
+
+Returns
+-------
+dict | list | int | None
+    The function may return different shapes depending on the underlying API helper:
+    - dict: an asset dict (or a wrapper containing 'rows' or 'payload'),
+    - list: list of assets (first match is used),
+    - int: sometimes a single asset id (the calling code handles this case),
+    - None: not found or error.
+Note: Callers should be defensive and normalize the result (see update_device_in_snipe_it).
+"""
     try:
         if verbose:
             print(f"Checking if device with serial number '{serial}' exists in Snipe-IT...")
@@ -313,6 +484,13 @@ def create_model_in_snipe_it(model_name, verify_ssl=True, verbose=False, slowdow
 
 # Create a new device in Snipe-IT
 def create_device_in_snipe_it(device, verify_ssl=True, verbose=False, slowdown=False):
+    """Create a new device in Snipe-IT using data from Azure (Intune).
+
+Important
+---------
+- The created asset will use the serial number as asset_tag by default.
+- Ensure that 'status_id' value is appropriate (the script maps compliance -> Pending etc.).
+"""
     try:
         if not isinstance(device, dict):
             raise TypeError(f"Expected device to be a dictionary, got {type(device)}")
@@ -341,13 +519,46 @@ def create_device_in_snipe_it(device, verify_ssl=True, verbose=False, slowdown=F
                 if not model_id:
                     raise Exception("Failed to create model for the device.")
 
-        device_data = {
-            "name": device.get('deviceName', 'Unknown Device'),
-            "serial": device.get('serialNumber'),
-            "model_id": model_id,
-            "manufacturer": device.get('manufacturer'),
-            "status_id": 1  # Active
+        # Ensure asset_tag (prefer deviceName -> name -> serialNumber)
+        asset_tag = device.get('deviceName') or device.get('name') or device.get('serialNumber') or ''
+        if not asset_tag:
+            asset_tag = device.get('serialNumber') or 'untagged'
+        asset_tag = str(asset_tag)
+
+        # Determine assigned user (try flexible matching)
+        azure_user_info = {
+            'userPrincipalName': device.get('userPrincipalName'),
+            'emailAddress': device.get('emailAddress'),
+            'userDisplayName': device.get('userDisplayName'),
+            'userName': device.get('userName'),
+            'userId': device.get('userId')
         }
+        assigned_user_id = find_snipe_user(azure_user_info, verify_ssl=verify_ssl, verbose=verbose, slowdown=slowdown)
+        if assigned_user_id and verbose:
+            print(f"Will assign asset to Snipe-IT user ID {assigned_user_id} (based on Azure user info: {azure_user_info})")
+
+        # Resolve statuses
+        deployed_status_id = get_status_id_by_name('Deployed', verify_ssl=verify_ssl, verbose=verbose, slowdown=slowdown)
+        ready_to_deploy_status_id = get_status_id_by_name('Ready to Deploy', verify_ssl=verify_ssl, verbose=verbose, slowdown=slowdown)
+        if not deployed_status_id:
+            deployed_status_id = 1
+        if not ready_to_deploy_status_id:
+            ready_to_deploy_status_id = 1
+
+        # Build create payload
+        device_data = {
+            'asset_tag': asset_tag,
+            'name': device.get('deviceName', 'Unknown Device'),
+            'serial': device.get('serialNumber'),
+            'model_id': model_id,
+            'manufacturer': device.get('manufacturer'),
+        }
+        # Always set status to Ready to Deploy on creation. If an assigned_user is present,
+        # include assigned_user so Snipe-IT performs the checkout (which may update the status to Deployed).
+        device_data['status_id'] = ready_to_deploy_status_id
+        if assigned_user_id:
+            device_data['assigned_user'] = assigned_user_id
+
 
         if verbose:
             print(f"Creating device in Snipe-IT: {device_data}")
@@ -385,6 +596,30 @@ def create_device_in_snipe_it(device, verify_ssl=True, verbose=False, slowdown=F
 
 # Update an existing device in Snipe-IT
 def update_device_in_snipe_it(snipe_id, device, verify_ssl=True, verbose=False, slowdown=False):
+    """Update an existing device in Snipe-IT based on serial number.
+
+Parameters
+----------
+device : dict
+    Device object from Microsoft Graph (Intune). Should include keys such as 'serialNumber',
+    'deviceName', 'userPrincipalName', 'emailAddress', 'complianceState', 'userDisplayName' etc.
+snipe_existing : dict|int|list, optional
+    If available, the existing Snipe-IT asset information can be passed in (dict with asset data,
+    or integer id, or list). If omitted, the function will query Snipe-IT by serial.
+verify_ssl : bool, optional
+    Whether to verify SSL on HTTP requests.
+verbose : bool, optional
+    When True, emits debug and informational logs.
+slowdown : bool, optional
+    When True, introduces small sleeps between API calls to avoid rate limits.
+
+Behavior
+--------
+- Normalizes the passed `snipe_existing` value (accepts int, list, dict).
+- Compares and updates only 'name', 'assigned_user', and 'status_id' when necessary.
+- Does NOT modify 'asset_tag' or 'serial'.
+- If an owner is newly assigned, creates a checkout record in Snipe-IT for traceability.
+"""
     try:
         if not isinstance(device, dict):
             raise TypeError(f"Expected device to be a dictionary, got {type(device)}")
@@ -403,12 +638,12 @@ def update_device_in_snipe_it(snipe_id, device, verify_ssl=True, verbose=False, 
         else:
             model_display_name = model_data.get('displayName', 'Unknown Model')
 
+        # Build update payload WITHOUT status_id to avoid changing existing status in Snipe-IT
         device_data = {
             "name": device.get('deviceName', 'Unknown Device'),
             "serial": device.get('serialNumber'),
             "model": model_display_name,
-            "manufacturer": device.get('manufacturer'),
-            "status_id": 1  # Active
+            "manufacturer": device.get('manufacturer')
         }
 
         # Fetch existing device data from Snipe-IT to check for changes

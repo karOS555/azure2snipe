@@ -1,28 +1,59 @@
-#Version 1.0.0
+# Version 2.0.0
 # Snipe-IT and Azure AD Sync Script
 
-This Python script allows you to import devices and users from Azure Active Directory (Azure AD) or InTune into a Snipe-IT instance, updating devices and users that already exist. It automates the synchronization process, helping you keep track of assets seamlessly.
+
+This repository contains a forked and extended version (v2.0.0) of the original `azure2snipe` sync script.
+
+
+> This file is an update to the original README (original was v1.0.0). See the changelog and PR for full details.
+
+---
 
 ## Features
 
 - Import devices from Azure AD or InTune.
 - Automatically create or update devices in Snipe-IT.
 - Assign devices to users as per Azure data.
-- Handle missing models and categories by creating them in Snipe-IT. (Currently broken.)
+- Handle missing models and categories by creating them in Snipe-IT.
 - Supports "dry-run" mode for testing without making changes.
 - Verbose mode for detailed logging.
 - Configurable SSL verification and TLS warning suppression.
 - Option to slow down requests to avoid rate-limiting.
 
+
+## What changed in v2.0.0 
+
+- **Asset tag equals Serial on import**: the script sets the `asset_tag` to the device `serialNumber` when creating new assets to avoid Snipe-IT validation errors.
+- **Smart update logic**: when a device already exists in Snipe-IT (matched by serial), the script will **not** overwrite `asset_tag` or `serial`. It updates only:
+  - `name` (device name),
+  - `assigned_user` (owner),
+  - `status_id` (device status) — only when appropriate.
+- **Improved owner assignment**:
+  - Flexible user lookup: tries `UPN`, `email`, derived username (from UPN), display name contains and last-resort userId.
+  - If a device gains an owner, the script creates a **checkout** in Snipe-IT (for traceability).
+- **Status handling based on compliance and ownership**:
+  - `noncompliant` (Intune) → `Pending` in Snipe-IT.
+  - `compliant` + **no owner** → `Ready to Deploy`.
+  - `compliant` + **has owner** → `Ready to Deploy` and checkout to assigned user
+- **Idempotency & safety**: re-running the script e.g daily will generally only change device name, owner or status on real changes; it preserves manual edits of `asset_tag` and `serial`.
+- **Robust API handling**: tolerates different shapes of Snipe-IT API responses (int id, list, dict with `rows` or `payload`) and avoids crashes
+- **Improved logging**: verbose mode (`-v`) shows normalization decisions and reasoned actions for easier troubleshooting.
+
+(For more details about v2.0.0, check out the detailed changelog in CHANGELOG.md)
+
+
 ## Prerequisites
 
-- Python 3.6+
+- Python 3.8+
 - MSAL Python Library for Azure AD authentication. (pip install msal)
 - Snipe-IT API token with permissions to manage hardware, models, and categories.
+- Azure App registration with `DeviceManagementManagedDevices.Read.All` and `User.Read.All`
+
 
 ## Configuration
 
 A template file should come with a copy of this script. Please remove ".template" from "azure2snipe.cfg" and add information as needed. Please see "APPREGGUIDE" for Azure config help.
+
 
 ## Usage
 
@@ -32,6 +63,7 @@ Run the script using the command line:
 python azure2snipe [OPTIONS]
 ```
 
+
 ### Options
 
 - `--dry-run` : Perform a dry run without making any changes to Snipe-IT.
@@ -39,6 +71,7 @@ python azure2snipe [OPTIONS]
 - `--do-not-verify-ssl` : Disable SSL verification for Snipe-IT requests.
 - `--slowdown` : Add a 1-second delay to each request to avoid rate-limiting.
 - `--suppress-tls-warning` : Suppress TLS warnings.
+
 
 ### Examples
 
@@ -62,6 +95,7 @@ python azure2snipe [OPTIONS]
    python azure2snipe --slowdown
    ```
 
+
 ## Error Handling
 
 The script includes enhanced error handling for common issues:
@@ -69,9 +103,31 @@ The script includes enhanced error handling for common issues:
 - If SSL verification is disabled, warnings are suppressed if the `--suppress-tls-warning` option is used.
 - Detailed error messages are provided for failed API calls.
 
+## Troubleshooting
+
+-If an asset is created with unexpected status, check:
+ -Intune complianceState.
+ -Whether Snipe-IT contains labels named exactly Deployed / Ready to Deploy / Pending.
+-Use -v for detailed logs (shows the exact decisions and matched user IDs).
+-If user matching fails, verify that Snipe-IT users have either username or email that matches Azure UPN or display name.
+
+
+## Recommended workflow (for production)
+
+-Run the script as a scheduled job (daily) so owner and name changes propagate automatically.
+-Keep asset_tag and serial stable in Snipe-IT (the script will not overwrite them).
+-Use --dry-run when testing new changes.
+
+
+## Changelog & Release Notes
+
+Please see CHANGELOG.md or the PR body for full details of v2.0.0 changes and rationale.
+
+
 ## Contributing
 
 Feel free to fork this project and submit pull requests. Contributions are always welcome to make the script more robust and feature-rich for the community.
+
 
 ## License
 
@@ -79,5 +135,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgements
 
+This fork was developed collaboratively (original project by bpcjr01; improvements implemented by karOS555).
 This script was developed with the assistance of ChatGPT, an AI language model by OpenAI. Special thanks to the Snipe-IT and Azure communities for their documentation and tools.
 
